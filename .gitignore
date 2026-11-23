@@ -1,0 +1,26 @@
+# data & model artifacts
+data_vf/
+datasets/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+*.h5
+
+# experiment output
+runs/
+wandb/
+outputs/
+logs/
+*.out
+*.err
+slurm-*.out
+
+# python / env
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+.env
