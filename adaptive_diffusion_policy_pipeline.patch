@@ -1,0 +1,1939 @@
+From 5e491a7f17417852f81e74a7526a3c3fb3f07542 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 24 Nov 2026 19:54:50 +0100
+Subject: [PATCH] Add policy comparison pipeline: sampler, metrics, plots,
+ SLURM jobs
+
+- sample_policies_mc.py: unified MC sampler for all acquisition policies
+  (A0 random, A1 max_variance, A2 max_entropy, A5 growing, A6 pop_order,
+  MSE oracle) using U3 full conditional re-sampling
+- compute_population_order.py: greedy A6 population-optimised order from
+  train/val ensemble variance (label-free, one fixed sequence for all patients)
+- compute_metrics_policies.py: RMSE, MAE, MD-MAE, sLV-MAE per-k, per-severity
+  stratum (normal/early/moderate/advanced/severe), and pointwise per VF location
+- plot_policy_comparison.py: publication-ready figures (per-k curves,
+  severity bars, pointwise heatmaps, compute cost, summary CSV)
+- merge_policy_parts.py: merge SLURM array partial outputs into single arrays
+- job_pop_order.sh: SLURM job for A6 order computation
+- job_policy_array.sh: SLURM array job (4 tasks) for any single policy
+- job_metrics.sh: SLURM CPU job for metrics computation
+- run_all_policies.sh: master launcher submitting full pipeline
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Y2EbGg2vQ4hhqKV1UXNbJ1
+---
+ compute_metrics_policies.py | 345 +++++++++++++++++++++++++++
+ compute_population_order.py | 294 +++++++++++++++++++++++
+ job_metrics.sh              |  44 ++++
+ job_policy_array.sh         |  81 +++++++
+ job_pop_order.sh            |  40 ++++
+ merge_policy_parts.py       | 112 +++++++++
+ plot_policy_comparison.py   | 370 +++++++++++++++++++++++++++++
+ run_all_policies.sh         |  94 ++++++++
+ sample_policies_mc.py       | 458 ++++++++++++++++++++++++++++++++++++
+ 9 files changed, 1838 insertions(+)
+ create mode 100644 compute_metrics_policies.py
+ create mode 100644 compute_population_order.py
+ create mode 100644 job_metrics.sh
+ create mode 100644 job_policy_array.sh
+ create mode 100644 job_pop_order.sh
+ create mode 100644 merge_policy_parts.py
+ create mode 100644 plot_policy_comparison.py
+ create mode 100644 run_all_policies.sh
+ create mode 100644 sample_policies_mc.py
+
+diff --git a/compute_metrics_policies.py b/compute_metrics_policies.py
+new file mode 100644
+index 0000000..a13e2de
+--- /dev/null
++++ b/compute_metrics_policies.py
+@@ -0,0 +1,345 @@
++"""
++compute_metrics_policies.py
++============================
++Compute reconstruction metrics from policy sampling outputs.
++
++Metrics
++-------
++  RMSE   – root mean squared error
++  MAE    – mean absolute error
++  MD     – mean deviation (mean of reconstructed field, clinical VF summary)
++  sLV    – square-root loss variance (sLV = sqrt( Var(pointwise errors) ))
++           Following Heijl et al.: sLV ≈ std of per-location TD errors
++
++All metrics are reported:
++  • Per k (number of observed locations, k = 0 … L)       → curves
++  • Overall (mean over test set)
++  • Per severity stratum at every k                        → strata curves
++  • Pointwise (per VF location, mean over test patients)   → heatmap inputs
++
++Severity strata (based on target MD, dB scale after inverse transform)
++  normal/near-normal   MD > -6
++  early                -12 < MD ≤ -6
++  moderate             -20 < MD ≤ -12
++  advanced             -28 < MD ≤ -20
++  severe               MD ≤ -28
++
++Usage
++-----
++# single policy output
++python compute_metrics_policies.py \
++    --pred_file  /storage/homefs/mc21s017/results/policy_max_variance_bern_3vf_pred.npy \
++    --target_file /storage/homefs/mc21s017/results/policy_max_variance_bern_3vf_target.npy \
++    --dataset bern \
++    --output_dir /storage/homefs/mc21s017/results/metrics/
++
++# or point to the meta file and let it resolve paths automatically
++python compute_metrics_policies.py \
++    --meta_file /storage/homefs/mc21s017/results/policy_max_variance_bern_3vf_offset0_mc100_meta.npz \
++    --dataset bern \
++    --output_dir /storage/homefs/mc21s017/results/metrics/
++"""
++
++import argparse
++import os
++
++import numpy as np
++
++
++# ─────────────────────────────────────────────────────────────────────────────
++# Inverse scaler helper
++# ─────────────────────────────────────────────────────────────────────────────
++
++def inverse_transform(arr, scaler):
++    """
++    Undo StandardScaler normalisation.
++    arr: (..., L) numpy array in normalised space.
++    Returns array of same shape in original dB space.
++    """
++    mean = scaler.mean_        # (L,)
++    std  = np.sqrt(scaler.var_)  # (L,)
++    return arr * std + mean
++
++
++# ─────────────────────────────────────────────────────────────────────────────
++# Clinical summary metrics on a VF field (in dB)
++# ─────────────────────────────────────────────────────────────────────────────
++
++def field_md(field_db):
++    """MD = mean of all TD values.  field_db: (..., L)."""
++    return np.mean(field_db, axis=-1)
++
++def field_slv(field_db):
++    """
++    sLV ≈ std of pointwise TD values across locations.
++    field_db: (..., L)  → returns (...,)
++    Following convention: sLV = sqrt( mean((TD_i - MD)^2 ) ).
++    """
++    return np.std(field_db, axis=-1)
++
++
++# ─────────────────────────────────────────────────────────────────────────────
++# Per-k metrics
++# ─────────────────────────────────────────────────────────────────────────────
++
++def compute_metrics_per_k(
++    pred_mean,   # (N, K+1, L)  MC mean, normalised space
++    target,      # (N, L)       ground truth, normalised space
++    scaler,      # sklearn scaler for inverse transform
++):
++    """
++    Returns dict with keys: rmse, mae, md_mae, slv_mae
++    Each value is a 1-D array of length K+1 (one entry per prefix level).
++    """
++    N, n_prefix, L = pred_mean.shape
++
++    rmse   = np.zeros(n_prefix)
++    mae    = np.zeros(n_prefix)
++    md_mae = np.zeros(n_prefix)
++    slv_mae= np.zeros(n_prefix)
++
++    target_db  = inverse_transform(target, scaler)         # (N, L)
++    target_md  = field_md(target_db)                       # (N,)
++    target_slv = field_slv(target_db)                      # (N,)
++
++    for k in range(n_prefix):
++        p_db   = inverse_transform(pred_mean[:, k, :], scaler)  # (N, L)
++        err    = p_db - target_db                                # (N, L)
++
++        rmse[k]    = np.sqrt(np.mean(err ** 2))
++        mae[k]     = np.mean(np.abs(err))
++
++        pred_md    = field_md(p_db)                              # (N,)
++        md_mae[k]  = np.mean(np.abs(pred_md - target_md))
++
++        pred_slv   = field_slv(p_db)                             # (N,)
++        slv_mae[k] = np.mean(np.abs(pred_slv - target_slv))
++
++    return dict(rmse=rmse, mae=mae, md_mae=md_mae, slv_mae=slv_mae)
++
++
++# ─────────────────────────────────────────────────────────────────────────────
++# Severity stratification
++# ─────────────────────────────────────────────────────────────────────────────
++
++SEVERITY_BINS = {
++    "normal":   (  -6.0,   np.inf),
++    "early":    ( -12.0,   -6.0),
++    "moderate": ( -20.0,  -12.0),
++    "advanced": ( -28.0,  -20.0),
++    "severe":   (-np.inf, -28.0),
++}
++
++
++def severity_mask(target_db, scaler=None):
++    """
++    Returns dict {stratum_name: boolean array (N,)}.
++    target_db: (N, L) in dB space.
++    """
++    md = field_md(target_db)   # (N,)
++    masks = {}
++    for name, (lo, hi) in SEVERITY_BINS.items():
++        masks[name] = (md > lo) & (md <= hi)
++    return masks
++
++
++def compute_metrics_per_k_per_severity(pred_mean, target, scaler):
++    """
++    Returns dict {stratum: {metric: array(n_prefix)}}.
++    """
++    target_db = inverse_transform(target, scaler)
++    masks     = severity_mask(target_db)
++    results   = {}
++    for name, mask in masks.items():
++        if mask.sum() == 0:
++            results[name] = None
++            continue
++        results[name] = compute_metrics_per_k(
++            pred_mean[mask], target[mask], scaler,
++        )
++    return results
++
++
++# ─────────────────────────────────────────────────────────────────────────────
++# Pointwise metrics (mean over patients, for each VF location)
++# ─────────────────────────────────────────────────────────────────────────────
++
++def compute_pointwise_metrics(pred_mean, target, scaler, ks=None):
++    """
++    Returns dict {k_label: array(L)} for each requested k value.
++    Default ks: [0, 10, 20, 30, len-1]
++    """
++    N, n_prefix, L = pred_mean.shape
++    if ks is None:
++        ks = sorted(set([0, 10, 20, 30, n_prefix - 1]))
++        ks = [k for k in ks if k < n_prefix]
++
++    target_db = inverse_transform(target, scaler)   # (N, L)
++    out = {}
++    for k in ks:
++        p_db      = inverse_transform(pred_mean[:, k, :], scaler)  # (N, L)
++        mae_pw    = np.mean(np.abs(p_db - target_db), axis=0)       # (L,)
++        out[f"k{k:03d}_mae"] = mae_pw
++        rmse_pw   = np.sqrt(np.mean((p_db - target_db) ** 2, axis=0))
++        out[f"k{k:03d}_rmse"] = rmse_pw
++    return out
++
++
++# ─────────────────────────────────────────────────────────────────────────────
++# Timing / compute cost summary
++# ─────────────────────────────────────────────────────────────────────────────
++
++def compute_timing_summary(timing):
++    """
++    timing: (N, n_prefix) wall-clock seconds for sampling call at each step.
++    Returns dict with mean/median/total per step.
++    """
++    return dict(
++        mean_per_step=timing.mean(axis=0),     # (n_prefix,)
++        median_per_step=np.median(timing, axis=0),
++        total_per_sample=timing.sum(axis=1).mean(),  # scalar
++        per_step_cumulative=np.cumsum(timing.mean(axis=0)),
++    )
++
++
++# ─────────────────────────────────────────────────────────────────────────────
++# Main
++# ─────────────────────────────────────────────────────────────────────────────
++
++def main():
++    parser = argparse.ArgumentParser(
++        description="Compute reconstruction metrics for a policy sampling output."
++    )
++    parser.add_argument("--meta_file",   type=str, default="",
++                        help="Path to _meta.npz from sample_policies_mc.py "
++                             "(auto-resolves pred/target paths).")
++    parser.add_argument("--pred_file",   type=str, default="")
++    parser.add_argument("--target_file", type=str, default="")
++    parser.add_argument("--timing_file", type=str, default="",
++                        help="Optional _timing.npy for compute-cost metrics.")
++    parser.add_argument("--dataset",   type=str, required=True, choices=["wa", "bern"])
++    parser.add_argument("--n_vf",      type=int, default=3,  choices=[3, 4])
++    parser.add_argument("--data_path", type=str,
++                        default="/storage/homefs/mc21s017/data_vf/")
++    parser.add_argument("--output_dir",  type=str,
++                        default="/storage/homefs/mc21s017/results/metrics/")
++    parser.add_argument("--output_name", type=str, default="",
++                        help="Stem for output files; inferred from meta if blank.")
++    parser.add_argument("--pointwise_ks", type=int, nargs="*", default=None,
++                        help="Specific k values for pointwise metrics. "
++                             "Default: 0,10,20,30,L-1.")
++    args = parser.parse_args()
++
++    # ── resolve paths ─────────────────────────────────────────────────────────
++    if args.meta_file:
++        meta      = np.load(args.meta_file, allow_pickle=True)
++        pred_path = str(meta["pred_path"])
++        tgt_path  = str(meta["target_path"])
++        policy    = str(meta.get("policy", "unknown"))
++        # timing lives beside the meta
++        timing_path = args.meta_file.replace("_meta.npz", "_timing.npy")
++        if not args.output_name:
++            args.output_name = os.path.basename(args.meta_file).replace("_meta.npz", "")
++    else:
++        if not args.pred_file or not args.target_file:
++            raise ValueError("Provide either --meta_file or both --pred_file and --target_file.")
++        pred_path   = args.pred_file
++        tgt_path    = args.target_file
++        timing_path = args.timing_file
++        policy      = "unknown"
++        if not args.output_name:
++            args.output_name = os.path.splitext(os.path.basename(pred_path))[0]
++
++    # ── load scaler ───────────────────────────────────────────────────────────
++    from train_sequential_observed import DATASETS
++    cfg         = DATASETS[args.dataset]
++    scaler_path = os.path.join(args.data_path, cfg["scaler_file"])
++    vf_scaler   = np.load(scaler_path, allow_pickle=True).item()
++
++    # ── load arrays ───────────────────────────────────────────────────────────
++    print(f"Loading pred  → {pred_path}")
++    pred_full  = np.load(pred_path, mmap_mode="r")   # (N, n_prefix, num_mc, L)
++    print(f"Loading target→ {tgt_path}")
++    target     = np.load(tgt_path)                    # (N, L)
++
++    N, n_prefix, num_mc, L = pred_full.shape
++    print(f"N={N}, n_prefix={n_prefix}, num_mc={num_mc}, L={L}")
++
++    # MC mean as point estimate
++    print("Computing MC mean...")
++    pred_mean = pred_full.mean(axis=2)   # (N, n_prefix, L)
++
++    # ── overall per-k metrics ─────────────────────────────────────────────────
++    print("Computing per-k metrics...")
++    metrics = compute_metrics_per_k(pred_mean, target, vf_scaler)
++
++    # ── per-severity per-k metrics ────────────────────────────────────────────
++    print("Computing per-severity metrics...")
++    sev_metrics = compute_metrics_per_k_per_severity(pred_mean, target, vf_scaler)
++
++    # ── pointwise metrics ─────────────────────────────────────────────────────
++    print("Computing pointwise metrics...")
++    pw_ks    = args.pointwise_ks if args.pointwise_ks else None
++    pw_metrics = compute_pointwise_metrics(pred_mean, target, vf_scaler, ks=pw_ks)
++
++    # ── timing ────────────────────────────────────────────────────────────────
++    timing_summary = None
++    if timing_path and os.path.exists(timing_path):
++        timing = np.load(timing_path)   # (N, n_prefix)
++        timing_summary = compute_timing_summary(timing)
++
++    # ── save ──────────────────────────────────────────────────────────────────
++    os.makedirs(args.output_dir, exist_ok=True)
++    out_path = os.path.join(args.output_dir, f"{args.output_name}_metrics.npz")
++
++    save_dict = dict(
++        policy=np.asarray(policy),
++        dataset=np.asarray(args.dataset),
++        n_vf=np.int64(args.n_vf),
++        n_test=np.int64(N),
++        n_prefix=np.int64(n_prefix),
++        L=np.int64(L),
++        num_mc=np.int64(num_mc),
++        prefix_ks=np.arange(n_prefix, dtype=np.int64),
++        # overall
++        rmse=metrics["rmse"],
++        mae=metrics["mae"],
++        md_mae=metrics["md_mae"],
++        slv_mae=metrics["slv_mae"],
++    )
++
++    # severity strata
++    for sname, smet in sev_metrics.items():
++        if smet is None:
++            continue
++        for mname, arr in smet.items():
++            save_dict[f"sev_{sname}_{mname}"] = arr
++
++    # pointwise
++    for key, arr in pw_metrics.items():
++        save_dict[f"pw_{key}"] = arr
++
++    # timing
++    if timing_summary:
++        for key, val in timing_summary.items():
++            save_dict[f"timing_{key}"] = val
++
++    np.savez_compressed(out_path, **save_dict)
++
++    # ── print summary ─────────────────────────────────────────────────────────
++    print(f"\n{'─'*60}")
++    print(f"Policy: {policy}  |  Dataset: {args.dataset}  |  N={N}")
++    print(f"{'k':>4}  {'RMSE':>8}  {'MAE':>8}  {'MD-MAE':>8}  {'sLV-MAE':>8}")
++    report_ks = [0, 5, 10, 15, 20, 25, 30, n_prefix - 1]
++    for k in report_ks:
++        if k >= n_prefix:
++            continue
++        print(
++            f"{k:4d}  {metrics['rmse'][k]:8.3f}  {metrics['mae'][k]:8.3f}"
++            f"  {metrics['md_mae'][k]:8.3f}  {metrics['slv_mae'][k]:8.3f}"
++        )
++    print(f"\nMetrics saved → {out_path}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/compute_population_order.py b/compute_population_order.py
+new file mode 100644
+index 0000000..dd3789d
+--- /dev/null
++++ b/compute_population_order.py
+@@ -0,0 +1,294 @@
++"""
++compute_population_order.py
++============================
++Compute the A6 population-optimised acquisition order from the train/val set.
++
++Algorithm (greedy, population-level)
++--------------------------------------
++  1. Sample k=0 ensemble for every train/val patient (no observed locations).
++  2. For each unseen location j, compute mean predictive variance across patients:
++         score(j) = mean_patients[ Var_mc[prediction at j] ]
++  3. Select j* = argmax score(j).  Add j* to the fixed order.
++  4. Resample all patients with j* observed (append to seen list).
++  5. Repeat until all L locations are ordered.
++
++The result is a single integer array of shape (L,) saved as a .npy file.
++Pass it to sample_policies_mc.py via --order_file.
++
++Usage
++-----
++python compute_population_order.py \
++    --dataset bern \
++    --n_vf 3 \
++    --checkpoint /storage/homefs/mc21s017/sequential_observed_bern_3vf.pth \
++    --num_mc 50 \
++    --mc_chunk 50 \
++    --batch_size 64 \
++    --output_dir /storage/homefs/mc21s017/results/
++"""
++
++import argparse
++import os
++import time
++
++import numpy as np
++import pandas as pd
++import torch
++from torch.utils.data import DataLoader, TensorDataset
++
++from ablation_models_diffusion_wa import DiffusionModelLoc
++from train_sequential_observed import (
++    DATASETS,
++    build_diffusion_schedule,
++    build_model_inputs,
++    choose_order,
++    process_df,
++)
++
++
++# ─────────────────────────────────────────────────────────────────────────────
++# Sampling kernel (same as sample_policies_mc.py)
++# ─────────────────────────────────────────────────────────────────────────────
++
++@torch.no_grad()
++def sample_mc_batch(
++    model, cond_v, cond_times, dt_future, target,
++    seen_loc_idx,
++    alphas, betas, cumalphas,
++    num_mc, mc_chunk,
++):
++    """Return (bsz, num_mc, L) float32 numpy array."""
++    device      = target.device
++    bsz, length = target.shape
++    num_steps   = cumalphas.shape[0]
++    produced    = 0
++    chunks      = []
++
++    while produced < num_mc:
++        m   = min(mc_chunk, num_mc - produced)
++        rep = m
++
++        cv  = [v.repeat_interleave(rep, dim=0) for v in cond_v]
++        ct  = [t.repeat_interleave(rep, dim=0) for t in cond_times]
++        dtf = dt_future.repeat_interleave(rep, dim=0)
++        locs = [torch.arange(length, device=device).float() for _ in cv]
++
++        if seen_loc_idx is not None and seen_loc_idx.numel() > 0:
++            cv.append(target[:, seen_loc_idx].repeat_interleave(rep, dim=0))
++            ct.append(dtf)
++            locs.append(seen_loc_idx.float())
++
++        locs.append(torch.arange(length, device=device).float())
++        x_t = torch.randn(bsz * rep, length, device=device)
++
++        with torch.autocast(device_type="cuda", dtype=torch.float16):
++            for t_step in range(num_steps - 1, 0, -1):
++                alpha_t    = alphas[t_step - 1]
++                cumalpha_t = cumalphas[t_step - 1]
++                sigma      = torch.sqrt(betas[t_step - 1])
++                factor     = (1 - alpha_t) / torch.sqrt(1 - cumalpha_t)
++                t_tensor   = torch.full((bsz * rep,), t_step,
++                                        device=device, dtype=torch.long)
++                noise_pred = model(
++                    x_t=x_t, v_hist=cv, dt_hist=ct,
++                    t_step=t_tensor, dt_future=dtf, locs=locs,
++                )
++                z   = torch.randn_like(x_t) if t_step > 1 else torch.zeros_like(x_t)
++                x_t = (1.0 / torch.sqrt(alpha_t)) * (x_t - factor * noise_pred) + sigma * z
++
++        chunks.append(x_t.view(bsz, rep, length).detach().cpu().numpy().astype(np.float32))
++        produced += rep
++
++    return np.concatenate(chunks, axis=1)   # (bsz, num_mc, L)
++
++
++# ─────────────────────────────────────────────────────────────────────────────
++# Population variance helpers
++# ─────────────────────────────────────────────────────────────────────────────
++
++def compute_population_variance_scores(
++    model, loader, device, max_cond_eff,
++    seen_prefix,          # list of int, observed location indices so far
++    alphas, betas, cumalphas,
++    num_mc, mc_chunk,
++):
++    """
++    For each location j, compute mean-over-patients of Var_mc[pred_j].
++    Returns array of shape (L,).
++    """
++    seen_tensor = (
++        torch.tensor(seen_prefix, dtype=torch.long, device=device)
++        if seen_prefix else None
++    )
++
++    sum_var = None
++    n_total = 0
++
++    for batch in loader:
++        batch  = [b.to(device, non_blocking=True) for b in batch]
++        cond_v, cond_times, _, dt_future, target = build_model_inputs(
++            batch, max_cond=max_cond_eff,
++        )
++        bsz = target.size(0)
++
++        samples = sample_mc_batch(
++            model, cond_v, cond_times, dt_future, target,
++            seen_tensor, alphas, betas, cumalphas, num_mc, mc_chunk,
++        )   # (bsz, num_mc, L)
++
++        # variance per patient per location, then sum across patients
++        batch_var = np.var(samples, axis=1)   # (bsz, L)
++        if sum_var is None:
++            sum_var = batch_var.sum(axis=0)   # (L,)
++        else:
++            sum_var += batch_var.sum(axis=0)
++        n_total += bsz
++
++    return sum_var / n_total   # (L,)
++
++
++# ─────────────────────────────────────────────────────────────────────────────
++# Main
++# ─────────────────────────────────────────────────────────────────────────────
++
++def main():
++    parser = argparse.ArgumentParser(
++        description="Compute A6 population-optimised acquisition order from train/val."
++    )
++    parser.add_argument("--dataset",    type=str, required=True, choices=["wa", "bern"])
++    parser.add_argument("--n_vf",       type=int, default=3,  choices=[3, 4])
++    parser.add_argument("--checkpoint", type=str, default="")
++    parser.add_argument("--num_steps",  type=int, default=52)
++    parser.add_argument("--max_cond",   type=int, default=2)
++    parser.add_argument("--D",          type=int, default=64)
++    parser.add_argument("--layers",     type=int, default=4)
++    parser.add_argument("--num_mc",     type=int, default=50,
++                        help="MC samples per patient per step (50 is usually enough).")
++    parser.add_argument("--mc_chunk",   type=int, default=50)
++    parser.add_argument("--batch_size", type=int, default=64)
++    parser.add_argument("--num_workers",type=int, default=2)
++    parser.add_argument("--seed",       type=int, default=0)
++    parser.add_argument("--data_path",  type=str,
++                        default="/storage/homefs/mc21s017/data_vf/")
++    parser.add_argument("--output_dir", type=str,
++                        default="/storage/homefs/mc21s017/results/")
++    parser.add_argument("--use_val",    action="store_true",
++                        help="If set, use validation split; otherwise use training split.")
++    args = parser.parse_args()
++
++    np.random.seed(args.seed)
++    torch.manual_seed(args.seed)
++    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
++
++    cfg    = DATASETS[args.dataset]
++    vf_key = f"{args.n_vf}vf"
++
++    # ── load train (or val) data ───────────────────────────────────────────────
++    # Train file is used by default; pass --use_val to use the test file as proxy
++    # (adjust if you have an explicit val split)
++    if args.use_val:
++        data_file = os.path.join(args.data_path, cfg["test_files"][vf_key])
++        split_name = "val(test-proxy)"
++    else:
++        data_file = os.path.join(args.data_path, cfg["train_files"][vf_key])
++        split_name = "train"
++
++    scaler_path = os.path.join(args.data_path, cfg["scaler_file"])
++    df          = pd.read_csv(data_file)
++    vf_scaler   = np.load(scaler_path, allow_pickle=True).item()
++    proc        = process_df(df, vf_scaler, cfg, args.n_vf)
++    dataset     = TensorDataset(*proc)
++
++    loader = DataLoader(
++        dataset, batch_size=args.batch_size, shuffle=False,
++        num_workers=args.num_workers, pin_memory=True,
++        persistent_workers=args.num_workers > 0,
++    )
++
++    n_patients  = len(dataset)
++    order_ref   = choose_order(args.dataset, cfg)
++    length      = len(order_ref)
++    max_cond_eff = min(args.max_cond, args.n_vf - 1)
++
++    print(f"Dataset:    {args.dataset} ({split_name}), {n_patients} patients")
++    print(f"L={length},  num_mc={args.num_mc},  batch_size={args.batch_size}")
++
++    # ── model ─────────────────────────────────────────────────────────────────
++    ckpt_path = args.checkpoint.strip() or os.path.join(
++        "/storage/homefs/mc21s017/",
++        f"sequential_observed_{args.dataset}_{args.n_vf}vf.pth",
++    )
++    ckpt = torch.load(ckpt_path, map_location=device)
++    inferred_layers = args.layers
++    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
++        sa_keys = [k for k in ckpt["model_state_dict"] if k.startswith("sa_blocks.")]
++        if sa_keys:
++            inferred_layers = max(int(k.split(".")[1]) for k in sa_keys) + 1
++            print(f"Inferred K={inferred_layers} from checkpoint.")
++
++    model = DiffusionModelLoc(
++        L=length, D=args.D, K=inferred_layers, max_cond=max_cond_eff,
++    ).to(device)
++    sd = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
++    model.load_state_dict(sd, strict=False)
++    model.eval()
++
++    alphas, betas, cumalphas = build_diffusion_schedule(args.num_steps, device)
++
++    # ── greedy population order ───────────────────────────────────────────────
++    pop_order   = []
++    unseen_set  = set(range(length))
++    t0          = time.time()
++
++    # We store per-step variance scores for diagnostics
++    var_scores_history = np.zeros((length, length), dtype=np.float32)
++
++    print("\nStarting greedy population order computation...")
++    for step in range(length):
++        t_step = time.time()
++        scores = compute_population_variance_scores(
++            model, loader, device, max_cond_eff,
++            seen_prefix=pop_order,
++            alphas=alphas, betas=betas, cumalphas=cumalphas,
++            num_mc=args.num_mc, mc_chunk=args.mc_chunk,
++        )
++        var_scores_history[step] = scores
++
++        unseen_arr = np.array(sorted(unseen_set), dtype=np.int64)
++        best       = int(unseen_arr[np.argmax(scores[unseen_arr])])
++        pop_order.append(best)
++        unseen_set.remove(best)
++
++        print(
++            f"Step {step + 1:3d}/{length}  selected={best:3d}"
++            f"  score={scores[best]:.4f}"
++            f"  ({time.time() - t_step:.1f}s / total {time.time() - t0:.1f}s)",
++            flush=True,
++        )
++
++    pop_order_arr = np.array(pop_order, dtype=np.int64)
++
++    # ── save ──────────────────────────────────────────────────────────────────
++    os.makedirs(args.output_dir, exist_ok=True)
++    order_path  = os.path.join(
++        args.output_dir, f"pop_order_{args.dataset}_{args.n_vf}vf.npy"
++    )
++    scores_path = os.path.join(
++        args.output_dir, f"pop_order_{args.dataset}_{args.n_vf}vf_scores.npy"
++    )
++    np.save(order_path,  pop_order_arr)
++    np.save(scores_path, var_scores_history)
++
++    print(f"\nPopulation order saved → {order_path}")
++    print(f"Variance score history → {scores_path}")
++    print(f"Order (first 20): {pop_order_arr[:20]}")
++    print(f"Total time: {time.time() - t0:.1f}s")
++
++
++def build_model_inputs(batch, max_cond):
++    from train_sequential_observed import build_model_inputs as _bmi
++    return _bmi(batch, max_cond)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/job_metrics.sh b/job_metrics.sh
+new file mode 100644
+index 0000000..ce6a8fa
+--- /dev/null
++++ b/job_metrics.sh
+@@ -0,0 +1,44 @@
++#!/bin/bash
++#SBATCH --job-name=metrics
++#SBATCH --output=logs/metrics_%j.out
++#SBATCH --error=logs/metrics_%j.err
++#SBATCH --time=02:00:00
++#SBATCH --mem=64G
++#SBATCH --cpus-per-task=4
++#SBATCH --nodes=1
++#SBATCH --account=invest
++#SBATCH --partition=cpu
++
++# Compute metrics for all policies.
++# Run after all sampling jobs have completed and parts have been merged.
++# Expects one merged _pred.npy / _target.npy / _timing.npy per policy.
++
++DATASET=${1:-bern}
++N_VF=${2:-3}
++DATA_PATH=/storage/homefs/mc21s017/data_vf/
++RESULTS_DIR=/storage/homefs/mc21s017/results/
++METRICS_DIR=/storage/homefs/mc21s017/results/metrics/
++
++module load Anaconda3
++eval "$(conda shell.bash hook)"
++
++mkdir -p ${METRICS_DIR}
++
++POLICIES=(random growing pop_order max_variance max_entropy mse_oracle)
++
++for POLICY in "${POLICIES[@]}"; do
++    META=${RESULTS_DIR}policy_${POLICY}_${DATASET}_${N_VF}vf_offset0_mc100_meta.npz
++    if [[ ! -f "${META}" ]]; then
++        echo "[SKIP] No meta file for policy=${POLICY}: ${META}"
++        continue
++    fi
++    echo "Computing metrics for policy=${POLICY} ..."
++    python compute_metrics_policies.py \
++        --meta_file  ${META} \
++        --dataset    ${DATASET} \
++        --n_vf       ${N_VF} \
++        --data_path  ${DATA_PATH} \
++        --output_dir ${METRICS_DIR}
++done
++
++echo "All metrics done!"
+diff --git a/job_policy_array.sh b/job_policy_array.sh
+new file mode 100644
+index 0000000..582a2b3
+--- /dev/null
++++ b/job_policy_array.sh
+@@ -0,0 +1,81 @@
++#!/bin/bash
++#SBATCH --job-name=policy_array
++#SBATCH --output=logs/policy_%x_%A_%a.out
++#SBATCH --error=logs/policy_%x_%A_%a.err
++#SBATCH --time=12:00:00
++#SBATCH --mem=32G
++#SBATCH --cpus-per-task=4
++#SBATCH --nodes=1
++#SBATCH --account=invest
++#SBATCH --partition=gpu-invest
++#SBATCH --qos=job_gpu_caim
++#SBATCH --gres=gpu:rtx4090:1
++#SBATCH --array=0-3
++
++# SLURM array job for a single policy.
++# 4 array tasks × 625 samples = 2500 patients (adjust SAMPLES_PER_JOB as needed).
++#
++# Submit with:
++#   sbatch --job-name=policy_random       job_policy_array.sh random    bern 3
++#   sbatch --job-name=policy_growing      job_policy_array.sh growing   bern 3
++#   sbatch --job-name=policy_pop_order    job_policy_array.sh pop_order bern 3
++#   sbatch --job-name=policy_max_variance job_policy_array.sh max_variance bern 3
++#   sbatch --job-name=policy_max_entropy  job_policy_array.sh max_entropy  bern 3
++#   sbatch --job-name=policy_mse_oracle   job_policy_array.sh mse_oracle   bern 3
++
++POLICY=${1:-random}
++DATASET=${2:-bern}
++N_VF=${3:-3}
++
++CHECKPOINT=/storage/homefs/mc21s017/sequential_observed_${DATASET}_${N_VF}vf.pth
++DATA_PATH=/storage/homefs/mc21s017/data_vf/
++OUTPUT_DIR=/storage/homefs/mc21s017/results/
++POP_ORDER_FILE=${OUTPUT_DIR}pop_order_${DATASET}_${N_VF}vf.npy
++
++SAMPLES_PER_JOB=625
++OFFSET=$(( SLURM_ARRAY_TASK_ID * SAMPLES_PER_JOB ))
++
++# For fixed (non-greedy) policies we can afford larger batch sizes
++if [[ "${POLICY}" == "growing" || "${POLICY}" == "pop_order" ]]; then
++    BATCH_SIZE=64
++else
++    BATCH_SIZE=1
++fi
++
++echo "Policy=${POLICY}  Dataset=${DATASET}  n_vf=${N_VF}"
++echo "Array task ${SLURM_ARRAY_TASK_ID}: offset=${OFFSET}, samples=${SAMPLES_PER_JOB}"
++
++module load Anaconda3
++eval "$(conda shell.bash hook)"
++
++mkdir -p logs
++mkdir -p ${OUTPUT_DIR}
++
++# Build optional --order_file argument for pop_order policy
++ORDER_FLAG=""
++if [[ "${POLICY}" == "pop_order" ]]; then
++    if [[ ! -f "${POP_ORDER_FILE}" ]]; then
++        echo "ERROR: pop_order file not found: ${POP_ORDER_FILE}"
++        echo "Run job_pop_order.sh first."
++        exit 1
++    fi
++    ORDER_FLAG="--order_file ${POP_ORDER_FILE}"
++fi
++
++python sample_policies_mc.py \
++    --dataset           ${DATASET} \
++    --n_vf              ${N_VF} \
++    --checkpoint        ${CHECKPOINT} \
++    --policy            ${POLICY} \
++    ${ORDER_FLAG} \
++    --num_mc            100 \
++    --mc_chunk          100 \
++    --batch_size        ${BATCH_SIZE} \
++    --num_workers       4 \
++    --sample_offset     ${OFFSET} \
++    --max_test_samples  ${SAMPLES_PER_JOB} \
++    --data_path         ${DATA_PATH} \
++    --output_dir        ${OUTPUT_DIR} \
++    --output_name       "policy_${POLICY}_${DATASET}_${N_VF}vf_part${SLURM_ARRAY_TASK_ID}"
++
++echo "Sampling complete for array task ${SLURM_ARRAY_TASK_ID}!"
+diff --git a/job_pop_order.sh b/job_pop_order.sh
+new file mode 100644
+index 0000000..c992735
+--- /dev/null
++++ b/job_pop_order.sh
+@@ -0,0 +1,40 @@
++#!/bin/bash
++#SBATCH --job-name=pop_order
++#SBATCH --output=logs/pop_order_%j.out
++#SBATCH --error=logs/pop_order_%j.err
++#SBATCH --time=24:00:00
++#SBATCH --mem=32G
++#SBATCH --cpus-per-task=4
++#SBATCH --nodes=1
++#SBATCH --account=invest
++#SBATCH --partition=gpu-invest
++#SBATCH --qos=job_gpu_caim
++#SBATCH --gres=gpu:rtx4090:1
++
++# Compute A6 population-optimised order from training set.
++# Must complete BEFORE the pop_order sampling jobs.
++
++DATASET=${1:-bern}
++N_VF=${2:-3}
++CHECKPOINT=/storage/homefs/mc21s017/sequential_observed_${DATASET}_${N_VF}vf.pth
++OUTPUT_DIR=/storage/homefs/mc21s017/results/
++
++echo "Computing population order for dataset=${DATASET}, n_vf=${N_VF}"
++
++module load Anaconda3
++eval "$(conda shell.bash hook)"
++
++mkdir -p logs
++mkdir -p ${OUTPUT_DIR}
++
++python compute_population_order.py \
++    --dataset      ${DATASET} \
++    --n_vf         ${N_VF} \
++    --checkpoint   ${CHECKPOINT} \
++    --num_mc       50 \
++    --mc_chunk     50 \
++    --batch_size   64 \
++    --num_workers  4 \
++    --output_dir   ${OUTPUT_DIR}
++
++echo "Population order computation complete!"
+diff --git a/merge_policy_parts.py b/merge_policy_parts.py
+new file mode 100644
+index 0000000..30127ad
+--- /dev/null
++++ b/merge_policy_parts.py
+@@ -0,0 +1,112 @@
++"""
++merge_policy_parts.py
++======================
++Merge partial output files produced by SLURM array jobs into a single
++pred/target/timing triple ready for compute_metrics_policies.py.
++
++Usage
++-----
++python merge_policy_parts.py \
++    --results_dir /storage/homefs/mc21s017/results/ \
++    --policy max_variance \
++    --dataset bern \
++    --n_vf 3 \
++    --n_parts 4 \
++    --num_mc 100
++"""
++
++import argparse
++import os
++import glob
++import numpy as np
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--results_dir", type=str, required=True)
++    parser.add_argument("--policy",      type=str, required=True)
++    parser.add_argument("--dataset",     type=str, required=True)
++    parser.add_argument("--n_vf",        type=int, default=3)
++    parser.add_argument("--n_parts",     type=int, required=True,
++                        help="Number of SLURM array tasks (parts).")
++    parser.add_argument("--num_mc",      type=int, default=100)
++    args = parser.parse_args()
++
++    stem = f"policy_{args.policy}_{args.dataset}_{args.n_vf}vf"
++
++    # Discover parts
++    pred_parts   = []
++    target_parts = []
++    timing_parts = []
++
++    for i in range(args.n_parts):
++        p = os.path.join(args.results_dir, f"{stem}_part{i}_pred.npy")
++        t = os.path.join(args.results_dir, f"{stem}_part{i}_target.npy")
++        ti= os.path.join(args.results_dir, f"{stem}_part{i}_timing.npy")
++        if not os.path.exists(p):
++            raise FileNotFoundError(f"Missing part {i}: {p}")
++        pred_parts.append(p)
++        target_parts.append(t)
++        timing_parts.append(ti if os.path.exists(ti) else None)
++
++    # Read first part to infer shape
++    p0        = np.load(pred_parts[0], mmap_mode="r")
++    _, n_prefix, num_mc, L = p0.shape
++    n_total   = sum(np.load(p, mmap_mode="r").shape[0] for p in pred_parts)
++
++    print(f"Merging {args.n_parts} parts → N={n_total}, n_prefix={n_prefix}, L={L}")
++
++    out_pred   = os.path.join(args.results_dir, f"{stem}_offset0_mc{args.num_mc}_pred.npy")
++    out_target = os.path.join(args.results_dir, f"{stem}_offset0_mc{args.num_mc}_target.npy")
++    out_timing = os.path.join(args.results_dir, f"{stem}_offset0_mc{args.num_mc}_timing.npy")
++
++    merged_pred   = np.lib.format.open_memmap(
++        out_pred,   mode="w+", dtype=np.float32, shape=(n_total, n_prefix, num_mc, L))
++    merged_target = np.lib.format.open_memmap(
++        out_target, mode="w+", dtype=np.float32, shape=(n_total, L))
++    has_timing = all(t is not None for t in timing_parts)
++    if has_timing:
++        merged_timing = np.lib.format.open_memmap(
++            out_timing, mode="w+", dtype=np.float32, shape=(n_total, n_prefix))
++
++    offset = 0
++    for i, (pp, tp, tip) in enumerate(zip(pred_parts, target_parts, timing_parts)):
++        pred_i   = np.load(pp,  mmap_mode="r")
++        target_i = np.load(tp)
++        n_i      = pred_i.shape[0]
++        merged_pred[offset:offset + n_i]   = pred_i
++        merged_target[offset:offset + n_i] = target_i
++        if has_timing and tip:
++            timing_i = np.load(tip)
++            merged_timing[offset:offset + n_i] = timing_i
++        offset += n_i
++        print(f"  Part {i}: {n_i} samples (cumulative {offset}/{n_total})")
++
++    # Write a minimal meta file so compute_metrics_policies.py can find the paths
++    meta_path = os.path.join(
++        args.results_dir,
++        f"{stem}_offset0_mc{args.num_mc}_meta.npz",
++    )
++    np.savez_compressed(
++        meta_path,
++        policy=np.asarray(args.policy),
++        dataset=np.asarray(args.dataset),
++        n_vf=np.int64(args.n_vf),
++        num_mc=np.int64(args.num_mc),
++        length=np.int64(L),
++        n_test=np.int64(n_total),
++        n_prefix=np.int64(n_prefix),
++        prefix_ks=np.arange(n_prefix, dtype=np.int64),
++        pred_path=np.asarray(out_pred),
++        target_path=np.asarray(out_target),
++    )
++
++    print(f"\nMerged pred   → {out_pred}")
++    print(f"Merged target → {out_target}")
++    if has_timing:
++        print(f"Merged timing → {out_timing}")
++    print(f"Meta          → {meta_path}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/plot_policy_comparison.py b/plot_policy_comparison.py
+new file mode 100644
+index 0000000..3753ec3
+--- /dev/null
++++ b/plot_policy_comparison.py
+@@ -0,0 +1,370 @@
++"""
++plot_policy_comparison.py
++==========================
++Publication-ready figures comparing acquisition policies.
++
++Figures produced
++----------------
++  1. per_k_curves_{metric}.pdf    – RMSE / MAE / MD-MAE / sLV-MAE vs k
++                                     one line per policy, shaded CI
++  2. severity_bars_{metric}.pdf   – per-severity grouped bar chart at a
++                                     fixed budget k (default: 20)
++  3. pointwise_heatmap_{policy}_k{k}.pdf – per-location MAE mapped to 24-2 grid
++  4. compute_cost.pdf             – cumulative wall-clock time vs k
++  5. summary_table.csv            – numeric summary for paper tables
++
++Usage
++-----
++python plot_policy_comparison.py \
++    --metrics_dir /storage/homefs/mc21s017/results/metrics/ \
++    --dataset bern \
++    --output_dir /storage/homefs/mc21s017/results/figures/ \
++    --budget_k 20
++"""
++
++import argparse
++import os
++import glob
++
++import numpy as np
++import matplotlib
++matplotlib.use("Agg")
++import matplotlib.pyplot as plt
++import matplotlib.ticker as mticker
++from matplotlib.gridspec import GridSpec
++import pandas as pd
++
++# ─────────────────────────────────────────────────────────────────────────────
++# Style
++# ─────────────────────────────────────────────────────────────────────────────
++
++POLICY_STYLE = {
++    # name in metrics file  : (display label, color, linestyle, marker)
++    "random":       ("A0 Random",           "#6b6b6b", "--",  "o"),
++    "growing":      ("A5 Growing (clinical)","#2196F3", "-.",  "s"),
++    "pop_order":    ("A6 Pop-optimised",     "#FF9800", ":",   "^"),
++    "max_variance": ("A1 Max Variance",      "#4CAF50", "-",   "D"),
++    "max_entropy":  ("A2 Max Entropy",       "#9C27B0", "-",   "v"),
++    "mse_oracle":   ("MSE Oracle (UB)",      "#F44336", "--",  "*"),
++}
++
++SEVERITY_ORDER   = ["normal", "early", "moderate", "advanced", "severe"]
++SEVERITY_LABELS  = {
++    "normal":   "Normal\n(MD>−6)",
++    "early":    "Early\n(−12–−6)",
++    "moderate": "Moderate\n(−20–−12)",
++    "advanced": "Advanced\n(−28–−20)",
++    "severe":   "Severe\n(≤−28)",
++}
++SEVERITY_COLORS  = ["#4CAF50", "#8BC34A", "#FFC107", "#FF5722", "#9C27B0"]
++
++METRIC_LABELS = {
++    "rmse":    "RMSE (dB)",
++    "mae":     "MAE (dB)",
++    "md_mae":  "MD MAE (dB)",
++    "slv_mae": "sLV MAE (dB)",
++}
++
++plt.rcParams.update({
++    "font.family":      "DejaVu Sans",
++    "font.size":        10,
++    "axes.titlesize":   11,
++    "axes.labelsize":   10,
++    "xtick.labelsize":   9,
++    "ytick.labelsize":   9,
++    "legend.fontsize":   9,
++    "figure.dpi":       150,
++    "savefig.dpi":      300,
++    "savefig.bbox":    "tight",
++    "axes.spines.top":  False,
++    "axes.spines.right":False,
++    "lines.linewidth":  1.5,
++})
++
++
++# ─────────────────────────────────────────────────────────────────────────────
++# Load all metrics files in a directory
++# ─────────────────────────────────────────────────────────────────────────────
++
++def load_all_metrics(metrics_dir, dataset):
++    files   = sorted(glob.glob(os.path.join(metrics_dir, f"*{dataset}*_metrics.npz")))
++    records = {}
++    for f in files:
++        d      = np.load(f, allow_pickle=True)
++        policy = str(d["policy"])
++        records[policy] = d
++        print(f"  Loaded: {policy} ({os.path.basename(f)})")
++    return records
++
++
++# ─────────────────────────────────────────────────────────────────────────────
++# Figure 1 – per-k metric curves
++# ─────────────────────────────────────────────────────────────────────────────
++
++def plot_per_k_curves(records, output_dir, metrics=("rmse", "mae", "md_mae", "slv_mae")):
++    for metric in metrics:
++        fig, ax = plt.subplots(figsize=(6, 4))
++        for policy, d in records.items():
++            if metric not in d:
++                continue
++            style  = POLICY_STYLE.get(policy, (policy, "black", "-", "o"))
++            label, color, ls, marker = style
++            ks   = d["prefix_ks"]
++            vals = d[metric]
++            ax.plot(ks, vals, color=color, linestyle=ls, label=label,
++                    marker=marker, markevery=max(1, len(ks)//10), markersize=4)
++
++        ax.set_xlabel("Number of observed locations (k)")
++        ax.set_ylabel(METRIC_LABELS.get(metric, metric))
++        ax.set_title(f"Policy comparison — {METRIC_LABELS.get(metric, metric)}")
++        ax.legend(loc="upper right", framealpha=0.9)
++        ax.xaxis.set_minor_locator(mticker.AutoMinorLocator(2))
++        ax.yaxis.set_minor_locator(mticker.AutoMinorLocator(2))
++        ax.grid(True, which="major", alpha=0.25)
++
++        out = os.path.join(output_dir, f"per_k_curves_{metric}.pdf")
++        fig.savefig(out)
++        plt.close(fig)
++        print(f"  Saved: {out}")
++
++
++# ─────────────────────────────────────────────────────────────────────────────
++# Figure 2 – per-severity grouped bars at fixed budget k
++# ─────────────────────────────────────────────────────────────────────────────
++
++def plot_severity_bars(records, output_dir, budget_k=20,
++                       metrics=("mae", "rmse")):
++    for metric in metrics:
++        # collect values: {policy: {severity: scalar}}
++        data = {}
++        for policy, d in records.items():
++            data[policy] = {}
++            for sname in SEVERITY_ORDER:
++                key = f"sev_{sname}_{metric}"
++                if key not in d:
++                    continue
++                arr = d[key]
++                if budget_k < len(arr):
++                    data[policy][sname] = float(arr[budget_k])
++
++        policies  = [p for p in POLICY_STYLE if p in data]
++        severities = [s for s in SEVERITY_ORDER
++                      if any(s in data[p] for p in policies)]
++
++        x       = np.arange(len(severities))
++        n_pol   = len(policies)
++        width   = 0.8 / max(n_pol, 1)
++
++        fig, ax = plt.subplots(figsize=(8, 4))
++        for pi, policy in enumerate(policies):
++            style  = POLICY_STYLE.get(policy, (policy, "black", "-", "o"))
++            label, color = style[0], style[1]
++            vals = [data[policy].get(s, np.nan) for s in severities]
++            offset = (pi - (n_pol - 1) / 2) * width
++            ax.bar(x + offset, vals, width=width * 0.9,
++                   color=color, label=label, alpha=0.85)
++
++        ax.set_xticks(x)
++        ax.set_xticklabels([SEVERITY_LABELS.get(s, s) for s in severities],
++                           ha="center")
++        ax.set_ylabel(METRIC_LABELS.get(metric, metric))
++        ax.set_title(f"Per-severity at k={budget_k} — {METRIC_LABELS.get(metric, metric)}")
++        ax.legend(loc="upper left", framealpha=0.9, ncol=2)
++        ax.yaxis.set_minor_locator(mticker.AutoMinorLocator(2))
++        ax.grid(True, axis="y", which="major", alpha=0.25)
++
++        out = os.path.join(output_dir, f"severity_bars_{metric}_k{budget_k}.pdf")
++        fig.savefig(out)
++        plt.close(fig)
++        print(f"  Saved: {out}")
++
++
++# ─────────────────────────────────────────────────────────────────────────────
++# Figure 3 – pointwise heatmap on 24-2 grid
++# ─────────────────────────────────────────────────────────────────────────────
++
++# 24-2 Humphrey grid coordinates (degrees visual angle)
++# bern has 59 points; wa (after removing 2 blind-spot cols) has 52 points
++# We use a standard 10x6 layout with the blind spot removed.
++# If xy coords are available we use them; otherwise we fall back to a linear index.
++
++def _default_grid_positions(L):
++    """Return (x_arr, y_arr) as placeholder linear positions."""
++    n_cols = int(np.ceil(np.sqrt(L)))
++    xs = np.arange(L) % n_cols
++    ys = np.arange(L) // n_cols
++    return xs.astype(float), ys.astype(float)
++
++
++def plot_pointwise_heatmap(records, output_dir, ks_to_plot=(0, 10, 20, 30),
++                           dataset="bern", data_path=""):
++    """Plot per-location MAE as a scatter heatmap on the VF grid."""
++    # Try to load xy coords
++    xy_x, xy_y = None, None
++    if data_path:
++        try:
++            if dataset == "wa":
++                import pandas as pd
++                df_xy = pd.read_csv(os.path.join(data_path, "p24d2.csv"))
++                xy_x  = df_xy["x"].values.astype(float)
++                xy_y  = df_xy["y"].values.astype(float)
++                # remove blind-spot cols 25,34 (0-based)
++                xy_x  = np.delete(xy_x, [25, 34])
++                xy_y  = np.delete(xy_y, [25, 34])
++            elif dataset == "bern":
++                import pandas as pd
++                df_xy = pd.read_excel(os.path.join(data_path, "x_y.xlsx"))
++                xy_x  = df_xy.iloc[:, 0].values.astype(float)
++                xy_y  = df_xy.iloc[:, 1].values.astype(float)
++        except Exception as e:
++            print(f"  [WARN] Could not load xy coords: {e}. Using linear layout.")
++
++    for policy, d in records.items():
++        style  = POLICY_STYLE.get(policy, (policy, "black", "-", "o"))
++        label  = style[0]
++        L      = int(d["L"])
++
++        if xy_x is None or len(xy_x) != L:
++            xs, ys = _default_grid_positions(L)
++        else:
++            xs, ys = xy_x, xy_y
++
++        for k in ks_to_plot:
++            key = f"pw_k{k:03d}_mae"
++            if key not in d:
++                continue
++            mae_pw = d[key]  # (L,)
++
++            fig, ax = plt.subplots(figsize=(5, 4))
++            sc = ax.scatter(xs, ys, c=mae_pw, cmap="RdYlGn_r",
++                            s=120, edgecolors="k", linewidths=0.3,
++                            vmin=0, vmax=np.percentile(mae_pw, 95))
++            cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
++            cbar.set_label("MAE (dB)")
++            ax.set_xlabel("x (degrees)")
++            ax.set_ylabel("y (degrees)")
++            ax.invert_xaxis()
++            ax.set_title(f"{label}  —  pointwise MAE at k={k}")
++            ax.set_aspect("equal")
++
++            out = os.path.join(output_dir,
++                               f"pointwise_heatmap_{policy}_k{k:03d}.pdf")
++            fig.savefig(out)
++            plt.close(fig)
++            print(f"  Saved: {out}")
++
++
++# ─────────────────────────────────────────────────────────────────────────────
++# Figure 4 – cumulative compute cost
++# ─────────────────────────────────────────────────────────────────────────────
++
++def plot_compute_cost(records, output_dir):
++    fig, ax = plt.subplots(figsize=(6, 4))
++    has_data = False
++    for policy, d in records.items():
++        key = "timing_per_step_cumulative"
++        if key not in d:
++            continue
++        style = POLICY_STYLE.get(policy, (policy, "black", "-", "o"))
++        label, color, ls, marker = style
++        ks   = d["prefix_ks"]
++        vals = d[key]
++        ax.plot(ks, vals, color=color, linestyle=ls, label=label,
++                marker=marker, markevery=max(1, len(ks)//10), markersize=4)
++        has_data = True
++
++    if not has_data:
++        plt.close(fig)
++        print("  [INFO] No timing data found. Skipping compute_cost figure.")
++        return
++
++    ax.set_xlabel("Number of observed locations (k)")
++    ax.set_ylabel("Cumulative time per sample (s)")
++    ax.set_title("Computational cost — cumulative sampling time")
++    ax.legend(loc="upper left", framealpha=0.9)
++    ax.grid(True, which="major", alpha=0.25)
++    out = os.path.join(output_dir, "compute_cost.pdf")
++    fig.savefig(out)
++    plt.close(fig)
++    print(f"  Saved: {out}")
++
++
++# ─────────────────────────────────────────────────────────────────────────────
++# Table – numeric summary
++# ─────────────────────────────────────────────────────────────────────────────
++
++def save_summary_table(records, output_dir, budget_ks=(5, 10, 20, 30)):
++    rows = []
++    for policy, d in records.items():
++        style = POLICY_STYLE.get(policy, (policy, "black", "-", "o"))
++        label = style[0]
++        for k in budget_ks:
++            if k >= int(d["n_prefix"]):
++                continue
++            row = {"Policy": label, "k": k}
++            for metric in ("rmse", "mae", "md_mae", "slv_mae"):
++                if metric in d:
++                    row[METRIC_LABELS.get(metric, metric)] = round(float(d[metric][k]), 3)
++            rows.append(row)
++
++    df  = pd.DataFrame(rows)
++    out = os.path.join(output_dir, "summary_table.csv")
++    df.to_csv(out, index=False)
++    print(f"  Saved: {out}")
++    print(df.to_string(index=False))
++
++
++# ─────────────────────────────────────────────────────────────────────────────
++# Main
++# ─────────────────────────────────────────────────────────────────────────────
++
++def main():
++    parser = argparse.ArgumentParser(
++        description="Generate publication-ready figures comparing acquisition policies."
++    )
++    parser.add_argument("--metrics_dir", type=str, required=True,
++                        help="Directory containing *_metrics.npz files.")
++    parser.add_argument("--dataset",   type=str, required=True, choices=["wa", "bern"])
++    parser.add_argument("--data_path", type=str,
++                        default="/storage/homefs/mc21s017/data_vf/",
++                        help="Path to VF data (for xy coordinates).")
++    parser.add_argument("--output_dir", type=str, required=True)
++    parser.add_argument("--budget_k",   type=int, default=20,
++                        help="Fixed budget k for severity bar charts.")
++    parser.add_argument("--pointwise_ks", type=int, nargs="*",
++                        default=[0, 10, 20, 30],
++                        help="k values for pointwise heatmaps.")
++    parser.add_argument("--summary_ks", type=int, nargs="*",
++                        default=[5, 10, 20, 30],
++                        help="k values in the summary table.")
++    args = parser.parse_args()
++
++    os.makedirs(args.output_dir, exist_ok=True)
++
++    print(f"\nLoading metrics from {args.metrics_dir} ...")
++    records = load_all_metrics(args.metrics_dir, args.dataset)
++    if not records:
++        raise RuntimeError(f"No *{args.dataset}*_metrics.npz files found in {args.metrics_dir}")
++
++    print(f"\nFigure 1: per-k curves")
++    plot_per_k_curves(records, args.output_dir)
++
++    print(f"\nFigure 2: severity bars at k={args.budget_k}")
++    plot_severity_bars(records, args.output_dir, budget_k=args.budget_k)
++
++    print(f"\nFigure 3: pointwise heatmaps")
++    plot_pointwise_heatmap(records, args.output_dir,
++                           ks_to_plot=args.pointwise_ks,
++                           dataset=args.dataset, data_path=args.data_path)
++
++    print(f"\nFigure 4: compute cost")
++    plot_compute_cost(records, args.output_dir)
++
++    print(f"\nTable: summary CSV")
++    save_summary_table(records, args.output_dir, budget_ks=args.summary_ks)
++
++    print(f"\nAll figures saved to {args.output_dir}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/run_all_policies.sh b/run_all_policies.sh
+new file mode 100644
+index 0000000..81be062
+--- /dev/null
++++ b/run_all_policies.sh
+@@ -0,0 +1,94 @@
++#!/bin/bash
++# run_all_policies.sh
++# ====================
++# Master launcher: submits the full pipeline for one dataset.
++#
++# Usage:
++#   bash run_all_policies.sh bern 3
++#   bash run_all_policies.sh wa   3
++#
++# Pipeline order:
++#   1. Compute A6 population order  (job_pop_order.sh)
++#   2. Sample all policies in parallel array jobs  (job_policy_array.sh)
++#      -- pop_order waits for step 1 to finish
++#   3. Merge parts  (merge_policy_parts.py, inline after each policy)
++#   4. Compute metrics  (job_metrics.sh)
++#   5. Plot  (inline, CPU-only)
++
++DATASET=${1:-bern}
++N_VF=${2:-3}
++N_PARTS=4           # number of SLURM array tasks per policy
++N_SAMPLES=2500      # total test samples (N_PARTS × SAMPLES_PER_JOB in job_policy_array.sh)
++NUM_MC=100
++
++RESULTS_DIR=/storage/homefs/mc21s017/results/
++DATA_PATH=/storage/homefs/mc21s017/data_vf/
++FIGS_DIR=${RESULTS_DIR}figures/
++
++mkdir -p logs ${RESULTS_DIR} ${FIGS_DIR}
++
++echo "========================================================"
++echo " Adaptive Diffusion – Policy Comparison Pipeline"
++echo " Dataset: ${DATASET}  n_vf: ${N_VF}"
++echo "========================================================"
++
++# ── Step 1: population order ──────────────────────────────────────────────────
++echo ""
++echo "[1/5] Submitting A6 population order job..."
++POP_JOB=$(sbatch --parsable job_pop_order.sh ${DATASET} ${N_VF})
++echo "      Job ID: ${POP_JOB}"
++
++# ── Step 2: sampling (all policies in parallel) ───────────────────────────────
++echo ""
++echo "[2/5] Submitting sampling jobs..."
++
++# Fixed policies (no dependency on pop order, batch inference)
++for POLICY in random growing max_variance max_entropy mse_oracle; do
++    JID=$(sbatch --parsable \
++        --job-name="pol_${POLICY:0:8}" \
++        job_policy_array.sh ${POLICY} ${DATASET} ${N_VF})
++    echo "      ${POLICY}: Job ${JID}"
++    eval "JID_${POLICY//_/}=${JID}"
++done
++
++# pop_order depends on pop order computation
++JID_poporder=$(sbatch --parsable \
++    --job-name="pol_pop_ord" \
++    --dependency=afterok:${POP_JOB} \
++    job_policy_array.sh pop_order ${DATASET} ${N_VF})
++echo "      pop_order: Job ${JID_poporder} (after ${POP_JOB})"
++
++# ── Step 3: merge parts (after all sampling done) ────────────────────────────
++# Build dependency list
++ALL_SAMPLE_JOBS="${JID_random}:${JID_growing}:${JID_maxvariance}:${JID_maxentropy}:${JID_mseoracle}:${JID_poporder}"
++
++echo ""
++echo "[3/5] Will merge parts after all sampling jobs complete."
++echo "      Run manually when done:"
++echo ""
++for POLICY in random growing pop_order max_variance max_entropy mse_oracle; do
++    echo "  python merge_policy_parts.py \\"
++    echo "      --results_dir ${RESULTS_DIR} \\"
++    echo "      --policy ${POLICY} --dataset ${DATASET} --n_vf ${N_VF} \\"
++    echo "      --n_parts ${N_PARTS} --num_mc ${NUM_MC}"
++done
++echo ""
++
++# ── Step 4: metrics ───────────────────────────────────────────────────────────
++echo "[4/5] Submit metrics job (run after merging):"
++echo "  sbatch job_metrics.sh ${DATASET} ${N_VF}"
++echo ""
++
++# ── Step 5: figures ───────────────────────────────────────────────────────────
++echo "[5/5] Plot (run after metrics):"
++echo "  python plot_policy_comparison.py \\"
++echo "      --metrics_dir ${RESULTS_DIR}metrics/ \\"
++echo "      --dataset ${DATASET} \\"
++echo "      --data_path ${DATA_PATH} \\"
++echo "      --output_dir ${FIGS_DIR} \\"
++echo "      --budget_k 20"
++echo ""
++echo "========================================================"
++echo " Sampling job IDs submitted. Monitor with:"
++echo "   squeue -u \$USER"
++echo "========================================================"
+diff --git a/sample_policies_mc.py b/sample_policies_mc.py
+new file mode 100644
+index 0000000..d968828
+--- /dev/null
++++ b/sample_policies_mc.py
+@@ -0,0 +1,458 @@
++"""
++sample_policies_mc.py
++=====================
++Unified Monte Carlo sampler for all acquisition policies.
++
++Policies
++--------
++  A0   random       – uniform random location selection
++  A1   max_variance – per-patient greedy: location with max marginal variance
++  A2   max_entropy  – per-patient greedy: location with max differential entropy
++                      (Gaussian approx; argmax identical to A1, kept separate for
++                      future kernel-density implementation)
++  A5   growing      – fixed order from choose_order() (clinical spiral)
++  A6   pop_order    – fixed order loaded from --order_file (A6 population-
++                      optimised sequence, computed by compute_population_order.py)
++  mse_oracle        – per-patient oracle: max |mean_pred - true_target|
++                      (upper bound; requires ground truth at test time)
++
++All policies use U3: full conditional re-sampling with the trained partial-
++observation diffusion model at every new measurement.
++
++Usage
++-----
++# A0 – random
++python sample_policies_mc.py --dataset bern --policy random ...
++
++# A1 – max variance (adaptive, per-patient)
++python sample_policies_mc.py --dataset bern --policy max_variance ...
++
++# A5 – growing (fixed clinical order)
++python sample_policies_mc.py --dataset bern --policy growing ...
++
++# A6 – population-optimised fixed order
++python sample_policies_mc.py --dataset bern --policy pop_order \
++    --order_file /storage/homefs/mc21s017/results/pop_order_bern_3vf.npy ...
++
++# MSE oracle
++python sample_policies_mc.py --dataset bern --policy mse_oracle ...
++"""
++
++import argparse
++import os
++import time
++
++import numpy as np
++import pandas as pd
++import torch
++from torch.utils.data import DataLoader, Subset, TensorDataset
++
++from ablation_models_diffusion_wa import DiffusionModelLoc
++from train_sequential_observed import (
++    DATASETS,
++    build_diffusion_schedule,
++    build_model_inputs,
++    choose_order,
++    process_df,
++)
++
++# ─────────────────────────────────────────────────────────────────────────────
++# Core sampling kernel  (identical to original sample_sequential_ordered_prefix_mc.py)
++# ─────────────────────────────────────────────────────────────────────────────
++
++@torch.no_grad()
++def sample_mc_for_single_prefix(
++    model, cond_v, cond_times, dt_future, target,
++    seen_loc_idx,           # 1-D LongTensor of observed location indices, or None
++    alphas, betas, cumalphas,
++    num_mc, mc_chunk,
++):
++    """Return samples array of shape (bsz, num_mc, L)."""
++    device     = target.device
++    bsz, length = target.shape
++    num_steps  = cumalphas.shape[0]
++    produced   = 0
++    chunks     = []
++
++    while produced < num_mc:
++        m   = min(mc_chunk, num_mc - produced)
++        rep = m
++
++        cond_v_rep     = [v.repeat_interleave(rep, dim=0) for v in cond_v]
++        cond_times_rep = [t.repeat_interleave(rep, dim=0) for t in cond_times]
++        dt_future_rep  = dt_future.repeat_interleave(rep, dim=0)
++        locs = [torch.arange(length, device=device).float()
++                for _ in range(len(cond_v_rep))]
++
++        if seen_loc_idx is not None and seen_loc_idx.numel() > 0:
++            target_seen = target[:, seen_loc_idx].repeat_interleave(rep, dim=0)
++            cond_v_rep.append(target_seen)
++            cond_times_rep.append(dt_future_rep)
++            locs.append(seen_loc_idx.float())
++
++        locs.append(torch.arange(length, device=device).float())
++        x_t = torch.randn(bsz * rep, length, device=device)
++
++        with torch.autocast(device_type="cuda", dtype=torch.float16):
++            for t_step in range(num_steps - 1, 0, -1):
++                alpha_t    = alphas[t_step - 1]
++                cumalpha_t = cumalphas[t_step - 1]
++                sigma      = torch.sqrt(betas[t_step - 1])
++                factor     = (1 - alpha_t) / torch.sqrt(1 - cumalpha_t)
++
++                t_tensor = torch.full((bsz * rep,), t_step,
++                                      device=device, dtype=torch.long)
++                noise_pred = model(
++                    x_t=x_t, v_hist=cond_v_rep, dt_hist=cond_times_rep,
++                    t_step=t_tensor, dt_future=dt_future_rep, locs=locs,
++                )
++                z   = torch.randn_like(x_t) if t_step > 1 else torch.zeros_like(x_t)
++                x_t = (1.0 / torch.sqrt(alpha_t)) * (x_t - factor * noise_pred) + sigma * z
++
++        chunks.append(x_t.view(bsz, rep, length).detach().cpu().numpy().astype(np.float32))
++        produced += rep
++
++    return np.concatenate(chunks, axis=1)   # (bsz, num_mc, L)
++
++
++# ─────────────────────────────────────────────────────────────────────────────
++# Acquisition functions  (greedy, per-patient)
++# ─────────────────────────────────────────────────────────────────────────────
++
++def acq_random(samples_k, unseen, target_np, rng):
++    """A0 – uniform random."""
++    return rng.choice(unseen)
++
++def acq_max_variance(samples_k, unseen, target_np, rng):
++    """A1 – location with greatest marginal predictive variance."""
++    var = np.var(samples_k, axis=0)          # (L,)
++    return unseen[np.argmax(var[unseen])]
++
++def acq_max_entropy(samples_k, unseen, target_np, rng):
++    """A2 – greatest differential entropy (Gaussian approx).
++    H ∝ log σ² → argmax same as A1; kept as a separate policy for
++    potential future replacement with a non-parametric estimator.
++    """
++    var = np.var(samples_k, axis=0) + 1e-12
++    return unseen[np.argmax(var[unseen])]
++
++def acq_mse_oracle(samples_k, unseen, target_np, rng):
++    """MSE oracle – max |mean_pred − target| (upper bound, needs true labels)."""
++    err = np.abs(np.mean(samples_k, axis=0) - target_np)   # (L,)
++    return unseen[np.argmax(err[unseen])]
++
++GREEDY_POLICIES = {
++    "random":      acq_random,
++    "max_variance": acq_max_variance,
++    "max_entropy":  acq_max_entropy,
++    "mse_oracle":   acq_mse_oracle,
++}
++FIXED_POLICIES = {"growing", "pop_order"}
++
++
++# ─────────────────────────────────────────────────────────────────────────────
++# Main
++# ─────────────────────────────────────────────────────────────────────────────
++
++def main():
++    parser = argparse.ArgumentParser(
++        description="Sample under a specified acquisition policy (U3 diffusion)."
++    )
++    # --- data / model ---
++    parser.add_argument("--dataset",    type=str, required=True, choices=["wa", "bern"])
++    parser.add_argument("--n_vf",       type=int, default=3,  choices=[3, 4])
++    parser.add_argument("--checkpoint", type=str, default="")
++    parser.add_argument("--num_steps",  type=int, default=52)
++    parser.add_argument("--max_cond",   type=int, default=2)
++    parser.add_argument("--D",          type=int, default=64)
++    parser.add_argument("--layers",     type=int, default=4)
++    parser.add_argument("--data_path",  type=str,
++                        default="/storage/homefs/mc21s017/data_vf/")
++    # --- policy ---
++    parser.add_argument(
++        "--policy", type=str, required=True,
++        choices=list(GREEDY_POLICIES.keys()) + list(FIXED_POLICIES),
++        help=(
++            "random       A0  – uniform random\n"
++            "max_variance A1  – per-patient max marginal variance\n"
++            "max_entropy  A2  – per-patient max differential entropy\n"
++            "growing      A5  – fixed clinical order (choose_order)\n"
++            "pop_order    A6  – fixed population-optimised order (--order_file)\n"
++            "mse_oracle       – per-patient oracle upper bound\n"
++        ),
++    )
++    parser.add_argument("--order_file", type=str, default="",
++                        help="Path to .npy order array for pop_order (A6) policy.")
++    # --- sampling ---
++    parser.add_argument("--num_mc",           type=int, default=100)
++    parser.add_argument("--mc_chunk",         type=int, default=10)
++    parser.add_argument("--batch_size",       type=int, default=1)
++    parser.add_argument("--num_workers",      type=int, default=2)
++    parser.add_argument("--max_test_samples", type=int, default=0,
++                        help="0 = full test set")
++    parser.add_argument("--sample_offset",    type=int, default=0)
++    parser.add_argument("--seed",             type=int, default=0)
++    # --- output ---
++    parser.add_argument("--output_dir",  type=str,
++                        default="/storage/homefs/mc21s017/results/")
++    parser.add_argument("--output_name", type=str, default="")
++
++    args = parser.parse_args()
++
++    # ── sanity checks ─────────────────────────────────────────────────────────
++    if args.mc_chunk <= 0:
++        raise ValueError("--mc_chunk must be > 0")
++    if args.policy == "pop_order" and not args.order_file:
++        raise ValueError("--policy pop_order requires --order_file")
++
++    # fixed policies can use batched inference; greedy must be per-sample
++    is_greedy = args.policy in GREEDY_POLICIES
++    batch_size = args.batch_size
++    if is_greedy and batch_size != 1:
++        print(f"[INFO] Policy '{args.policy}' is per-patient. Forcing batch_size=1.")
++        batch_size = 1
++
++    # ── reproducibility ───────────────────────────────────────────────────────
++    np.random.seed(args.seed)
++    rng = np.random.default_rng(args.seed)
++    torch.manual_seed(args.seed)
++
++    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
++    cfg    = DATASETS[args.dataset]
++    vf_key = f"{args.n_vf}vf"
++
++    # ── data ──────────────────────────────────────────────────────────────────
++    test_file   = os.path.join(args.data_path, cfg["test_files"][vf_key])
++    scaler_path = os.path.join(args.data_path, cfg["scaler_file"])
++    df_test     = pd.read_csv(test_file)
++    vf_scaler   = np.load(scaler_path, allow_pickle=True).item()
++
++    proc_test    = process_df(df_test, vf_scaler, cfg, args.n_vf)
++    test_ds_full = TensorDataset(*proc_test)
++
++    if args.max_test_samples > 0:
++        end_idx = min(args.sample_offset + args.max_test_samples, len(test_ds_full))
++        test_ds = Subset(test_ds_full, list(range(args.sample_offset, end_idx)))
++    else:
++        test_ds = test_ds_full
++
++    test_loader = DataLoader(
++        test_ds, batch_size=batch_size, shuffle=False,
++        num_workers=args.num_workers, pin_memory=True,
++        persistent_workers=args.num_workers > 0,
++    )
++
++    # ── fixed order ───────────────────────────────────────────────────────────
++    clinical_order = choose_order(args.dataset, cfg)   # A5 / fallback
++    length         = len(clinical_order)
++    max_cond_eff   = min(args.max_cond, args.n_vf - 1)
++
++    if args.policy == "growing":
++        fixed_order = clinical_order
++    elif args.policy == "pop_order":
++        fixed_order = np.load(args.order_file).tolist()
++        assert len(fixed_order) == length, (
++            f"pop_order length {len(fixed_order)} != VF length {length}"
++        )
++    else:
++        fixed_order = None   # greedy policies don't use a fixed order
++
++    # ── model ─────────────────────────────────────────────────────────────────
++    ckpt_path = args.checkpoint.strip() or os.path.join(
++        "/storage/homefs/mc21s017/",
++        f"sequential_observed_{args.dataset}_{args.n_vf}vf.pth",
++    )
++    ckpt = torch.load(ckpt_path, map_location=device)
++
++    inferred_layers = args.layers
++    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
++        sa_keys = [k for k in ckpt["model_state_dict"] if k.startswith("sa_blocks.")]
++        if sa_keys:
++            inferred_layers = max(int(k.split(".")[1]) for k in sa_keys) + 1
++            print(f"Inferred K={inferred_layers} from checkpoint.")
++
++    model = DiffusionModelLoc(
++        L=length, D=args.D, K=inferred_layers, max_cond=max_cond_eff,
++    ).to(device)
++    sd = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
++    model.load_state_dict(sd, strict=False)
++    model.eval()
++
++    alphas, betas, cumalphas = build_diffusion_schedule(args.num_steps, device)
++
++    # ── output arrays ─────────────────────────────────────────────────────────
++    n_test   = len(test_ds)
++    n_prefix = length + 1   # k = 0 … L
++
++    if not args.output_name:
++        args.output_name = (
++            f"policy_{args.policy}_{args.dataset}_{args.n_vf}vf"
++            f"_offset{args.sample_offset}_mc{args.num_mc}"
++        )
++
++    os.makedirs(args.output_dir, exist_ok=True)
++    pred_path   = os.path.join(args.output_dir, f"{args.output_name}_pred.npy")
++    target_path = os.path.join(args.output_dir, f"{args.output_name}_target.npy")
++    timing_path = os.path.join(args.output_dir, f"{args.output_name}_timing.npy")
++    meta_path   = os.path.join(args.output_dir, f"{args.output_name}_meta.npz")
++
++    # shape: (n_test, n_prefix, num_mc, L)
++    pred_mem = np.lib.format.open_memmap(
++        pred_path,  mode="w+", dtype=np.float32,
++        shape=(n_test, n_prefix, args.num_mc, length),
++    )
++    target_mem = np.lib.format.open_memmap(
++        target_path, mode="w+", dtype=np.float32, shape=(n_test, length),
++    )
++    # wall-clock seconds per (sample, prefix-step) for the sampling call alone
++    timing_mem = np.lib.format.open_memmap(
++        timing_path, mode="w+", dtype=np.float32, shape=(n_test, n_prefix),
++    )
++    # the order used for each test sample (L,) – same for all if fixed policy
++    all_orders = np.empty((n_test, length), dtype=np.int64)
++
++    print(f"Policy:        {args.policy}")
++    print(f"Device:        {device}")
++    print(f"Checkpoint:    {ckpt_path}")
++    print(f"Test samples:  {n_test}  (offset {args.sample_offset})")
++    print(f"L={length}, n_prefix={n_prefix}, num_mc={args.num_mc}")
++    print(f"pred  → {pred_path}")
++    print(f"target→ {target_path}")
++
++    t0     = time.time()
++    offset = 0
++
++    # ═══════════════════════════════════════════════════════════════════════════
++    # FIXED POLICIES  (A5 growing, A6 pop_order) – batch_size can be > 1
++    # ═══════════════════════════════════════════════════════════════════════════
++    if not is_greedy:
++        order_tensor = torch.tensor(fixed_order, dtype=torch.long, device=device)
++
++        for batch_idx, batch in enumerate(test_loader):
++            batch = [b.to(device, non_blocking=True) for b in batch]
++            cond_v, cond_times, _, dt_future, target = build_model_inputs(
++                batch, max_cond=max_cond_eff,
++            )
++            bsz = target.size(0)
++            target_mem[offset:offset + bsz] = (
++                target.detach().cpu().numpy().astype(np.float32)
++            )
++            for gi in range(bsz):
++                all_orders[offset + gi] = np.array(fixed_order, dtype=np.int64)
++
++            for k in range(n_prefix):
++                seen_loc_idx = order_tensor[:k] if k > 0 else None
++                t_k  = time.time()
++                pred = sample_mc_for_single_prefix(
++                    model, cond_v, cond_times, dt_future, target,
++                    seen_loc_idx, alphas, betas, cumalphas,
++                    args.num_mc, args.mc_chunk,
++                )
++                dt_k = time.time() - t_k
++                pred_mem[offset:offset + bsz, k]    = pred
++                timing_mem[offset:offset + bsz, k]  = dt_k / bsz
++
++            offset += bsz
++            print(
++                f"Batch {batch_idx + 1:4d} | processed={offset}/{n_test}"
++                f" | elapsed={time.time() - t0:.1f}s",
++                flush=True,
++            )
++
++    # ═══════════════════════════════════════════════════════════════════════════
++    # GREEDY POLICIES  (A0 random, A1 max_variance, A2 max_entropy, mse_oracle)
++    # batch_size forced to 1 above
++    # ═══════════════════════════════════════════════════════════════════════════
++    else:
++        acq_fn = GREEDY_POLICIES[args.policy]
++
++        for batch_idx, batch in enumerate(test_loader):
++            batch = [b.to(device, non_blocking=True) for b in batch]
++            cond_v, cond_times, _, dt_future, target = build_model_inputs(
++                batch, max_cond=max_cond_eff,
++            )
++            # bsz == 1 always
++            target_np = target.detach().cpu().numpy().astype(np.float32)   # (1, L)
++            target_mem[offset] = target_np[0]
++
++            t_total = time.time()
++
++            seen_prefix = []
++            unseen_set  = set(range(length))
++
++            # ── k = 0 : no observed locations ─────────────────────────────────
++            t_k   = time.time()
++            pred0 = sample_mc_for_single_prefix(
++                model, cond_v, cond_times, dt_future, target,
++                None, alphas, betas, cumalphas, args.num_mc, args.mc_chunk,
++            )
++            timing_mem[offset, 0] = time.time() - t_k
++            pred_mem[offset, 0]   = pred0[0]
++
++            # ── k = 1 … L : greedy selection ──────────────────────────────────
++            for k in range(1, length + 1):
++                samples_prev = pred_mem[offset, k - 1]           # (num_mc, L)
++                unseen_arr   = np.array(sorted(unseen_set), dtype=np.int64)
++
++                next_loc = acq_fn(
++                    samples_prev, unseen_arr, target_np[0], rng,
++                )
++                seen_prefix.append(int(next_loc))
++                unseen_set.remove(int(next_loc))
++
++                seen_tensor = torch.tensor(
++                    seen_prefix, dtype=torch.long, device=device,
++                )
++                t_k   = time.time()
++                pred_k = sample_mc_for_single_prefix(
++                    model, cond_v, cond_times, dt_future, target,
++                    seen_tensor, alphas, betas, cumalphas,
++                    args.num_mc, args.mc_chunk,
++                )
++                timing_mem[offset, k] = time.time() - t_k
++                pred_mem[offset, k]   = pred_k[0]
++
++            all_orders[offset] = np.array(seen_prefix, dtype=np.int64)
++
++            print(
++                f"Sample {offset + 1:4d}/{n_test}"
++                f" | {time.time() - t_total:.1f}s"
++                f" | elapsed={time.time() - t0:.1f}s",
++                flush=True,
++            )
++            offset += 1
++
++    # ── metadata ──────────────────────────────────────────────────────────────
++    np.savez_compressed(
++        meta_path,
++        dataset=np.asarray(args.dataset),
++        n_vf=np.int64(args.n_vf),
++        num_steps=np.int64(args.num_steps),
++        max_cond=np.int64(max_cond_eff),
++        num_mc=np.int64(args.num_mc),
++        length=np.int64(length),
++        n_test=np.int64(n_test),
++        prefix_ks=np.arange(n_prefix, dtype=np.int64),
++        policy=np.asarray(args.policy),
++        fixed_order=np.asarray(fixed_order if fixed_order else clinical_order,
++                               dtype=np.int64),
++        all_orders=all_orders,
++        pred_path=np.asarray(pred_path),
++        target_path=np.asarray(target_path),
++        checkpoint=np.asarray(ckpt_path),
++        sample_offset=np.int64(args.sample_offset),
++    )
++
++    print(f"\nDone. Total: {time.time() - t0:.1f}s")
++    print(f"Metadata → {meta_path}")
++    print(f"Timing   → {timing_path}")
++
++
++def build_model_inputs(batch, max_cond):
++    """Re-export from train_sequential_observed (avoid circular import)."""
++    from train_sequential_observed import build_model_inputs as _bmi
++    return _bmi(batch, max_cond)
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.43.0
+
